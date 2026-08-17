@@ -31,89 +31,59 @@ Typical flow: a "coordinator" conversation breaks work into subtasks and sends e
 
 ## Installation
 
-> This section is written so that **another agent can perform the installation by following the steps literally**. Do not skip steps 2 and 3 — a package that is copied into the tree but never declared or mounted will NOT load.
+This is a DeepSeek Harness **bundle** (it declares `dsh.bundle` and ships a `cordis.patch.yml`), installed through `dsh plugin add` — the same workflow as the official "Package and install a plugin" tutorial. No manual editing of the harness checkout is required.
 
-### Prerequisites
+> This section is written so that **another agent can perform the installation by following the steps literally**.
 
-- A working DeepSeek Harness checkout (the pnpm monorepo containing `apps/cli`, `packages/bundle/web-app`, `packages/core/…`, and a `pnpm-workspace.yaml`).
-- `pnpm` available on PATH.
+### Option A — install from the git repository
 
-### Step 1 — copy this repository into the harness
-
-Place the **entire contents of this repository** under:
-
-```
-<packages root>/packages/extensions/dsh-hive/
+```bash
+dsh plugin --profile <name> add github:llluchy/dsh-hive
 ```
 
-The directory name **must be exactly `dsh-hive`** — it must match the package name suffix (`@deepseek-ai/dsh-hive`), otherwise pnpm's `workspace:^` linking and the package `exports` will not resolve.
+Details to be aware of when using the git source:
 
-### Step 2 — declare the dependency
+- A git install fetches **sources**, not built artifacts, so pnpm runs the package's `prepare` script (which transpiles `src/` into `lib/` with esbuild; every harness import is externalized and resolves at runtime from the installed harness — no sibling monorepo is assumed).
+- `pnpm` ≥ 10 refuses to run a git dependency's build script until it is allowlisted. The first `add` points at the fix: copy the exact package key into the profile's `pnpm-workspace.yaml`, for example:
 
-In `<repo root>/apps/cli/package.json`, inside the `"dependencies"` object, add:
+  ```yaml
+  allowBuilds:
+    dsh-hive: true
+  ```
 
-```json
-"@deepseek-ai/dsh-hive": "workspace:^",
+  then re-run the `add`. Treat this allowance as permission to execute the package's code at install time — only allow it if you trust the source, and pin a commit (`github:llluchy/dsh-hive#<sha>`).
+
+### Option B — install prebuilt artifacts (no build permission needed)
+
+Either publish to npm (with `lib/` built at publish time) and:
+
+```bash
+dsh plugin --profile <name> add dsh-hive
 ```
 
-Keep valid JSON (mind the trailing comma of the previous line).
+or ship a tarball:
 
-### Step 3 — mount the plugin
+```bash
+pnpm pack            # produces dsh-hive-<version>.tgz
+dsh plugin --profile <name> add ./dsh-hive-<version>.tgz
+```
 
-This plugin is **host-only** (it has no browser half), so it must be mounted at the **host plane**, not inside an agent preset.
+The repository already ships a prebuilt `lib/index.js` and `lib/index.d.ts`, so the tarball installs without running any build.
 
-In `<repo root>/packages/bundle/web-app/cordis.patch.yml`, inside the `insert:` block (the same list that contains rows such as `web-runtime` and `client-hmr`), add:
+### Verify the layer
+
+```bash
+dsh --profile <name> --dump-config
+```
+
+The output shows a `dsh-hive` layer containing:
 
 ```yaml
 - id: dsh-hive
-  name: '@deepseek-ai/dsh-hive'
+  name: dsh-hive
 ```
 
-Keep valid YAML (same indentation level as the neighbouring `- id:` rows).
-
-### Step 4 — link the workspace
-
-From the repo root run:
-
-```bash
-pnpm install
-```
-
-Verify the link exists:
-
-```bash
-test -d apps/cli/node_modules/@deepseek-ai/dsh-hive && echo linked
-```
-
-### Step 5 — build the package (optional if you did not change the source)
-
-Prebuilt artifacts are shipped in `lib/`. If you changed anything under `src/`, rebuild:
-
-```bash
-pnpm exec tsc -b packages/extensions/dsh-hive
-pnpm --filter @deepseek-ai/dsh-hive exec tsdown --env.DSH_BUILD_FACE=host
-```
-
-### Step 6 — restart the harness web server
-
-Restart the running `dsh web` process so the composition reloads.
-
-### Step 7 — verify
-
-Check the resolved composition:
-
-```bash
-pnpm dsh --profile web --dump-config
-```
-
-It must contain:
-
-```yaml
-- id: dsh-hive
-  name: '@deepseek-ai/dsh-hive'
-```
-
-Then, in any conversation, ask the agent to call `list_sessions` — it should return the live conversations.
+Then boot with `dsh --profile <name>` and, in any conversation, ask the agent to call `list_sessions` — it should return the live conversations.
 
 ---
 

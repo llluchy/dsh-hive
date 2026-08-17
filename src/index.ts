@@ -7,7 +7,7 @@
  * target session id. This is the thinnest possible wrapper over the built-in
  * Agent registry — no groups, no @mentions, no storage.
  *
- * @module @deepseek-ai/dsh-hive
+ * @module dsh-hive
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'

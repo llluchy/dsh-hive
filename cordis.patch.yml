@@ -1,0 +1,8 @@
+# dsh-hive bundle layer.
+#
+# Installed via `dsh plugin add` this file is applied as a bundle patch when a
+# profile lists dsh-hive in its `dsh.profile.bundles`. The row references the
+# package by its own name, so Node resolution finds the installed code.
+- insert:
+    - id: dsh-hive
+      name: dsh-hive
