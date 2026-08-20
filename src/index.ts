@@ -1,11 +1,16 @@
 /**
- * Minimal cross-session messaging tools.
+ * Cross-session messaging tools for DeepSeek Harness conversations.
  *
  * `send_to_session` delivers a plain text message straight into another live
  * conversation and wakes it (`agents.get(id).followup(...)`), and
- * `list_sessions` enumerates the live conversations so the model can discover a
- * target session id. This is the thinnest possible wrapper over the built-in
- * Agent registry — no groups, no @mentions, no storage.
+ * `list_sessions` enumerates the live conversations (with their titles) so the
+ * model can discover a target. This is the thinnest possible wrapper over the
+ * built-in Agent registry — no groups, no @mentions, no storage.
+ *
+ * Matching policy: both tools take EXACT values only. The model does the
+ * semantic understanding (e.g. a user saying "B" means the conversation the
+ * user named "小B"); the tools resolve an exact session id or an exact full
+ * name, and refuse with candidates when anything is ambiguous.
  *
  * @module dsh-hive
  */
@@ -26,8 +31,17 @@ interface AgentsLike {
   list(): MessengerAgentLike[]
 }
 
+/** Structural minimum over the session-query title API. */
+interface SessionQueryLike {
+  readTitleSnapshots(ids: readonly string[]): Promise<Array<{
+    sessionId?: string
+    status?: string
+    value?: { session?: { id?: string }; title?: { title?: string } }
+  }>>
+}
+
 export const name = 'dsh-hive'
-export const inject = ['tools', 'agents']
+export const inject = ['tools', 'agents', 'sessionQuery']
 
 const uid = (prefix: string): string =>
   prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
@@ -37,6 +51,47 @@ const errText = (e: unknown): string => String((e as { message?: string })?.mess
 export function apply(ctx: Context): void {
   const agents = ctx.get('agents') as AgentsLike | undefined
   if (agents === undefined) return
+  const sessionQuery = ctx.get('sessionQuery') as SessionQueryLike | undefined
+
+  const shortId = (id: string): string => {
+    const bare = id.startsWith('session-') ? id.slice('session-'.length) : id
+    return bare.slice(0, 8)
+  }
+
+  /** One live conversation plus its display name. */
+  interface NamedSession {
+    id: string
+    status: 'idle' | 'running'
+    cwd?: string
+    name: string
+  }
+
+  /** Enumerate live conversations and fold in their session titles. */
+  async function liveSessionsWithNames(): Promise<NamedSession[]> {
+    const list = agents.list()
+    const names = new Map<string, string>()
+    if (sessionQuery !== undefined && list.length > 0) {
+      try {
+        const results = await sessionQuery.readTitleSnapshots(list.map(a => String(a.id)))
+        for (const r of results) {
+          if (r === undefined || r === null || r.status !== 'fulfilled') continue
+          const sid = r.value?.session?.id
+          const title = r.value?.title?.title
+          if (sid !== undefined && title !== undefined && String(title).trim() !== '') {
+            names.set(String(sid), String(title).trim())
+          }
+        }
+      } catch {
+        /* 标题读取失败不阻塞列表：回退到短 id */
+      }
+    }
+    return list.map(a => ({
+      id: String(a.id),
+      status: a.status,
+      ...(a.session?.header?.cwd === undefined ? {} : { cwd: a.session.header.cwd }),
+      name: names.get(String(a.id)) ?? '会话' + shortId(String(a.id)),
+    }))
+  }
 
   /** Render the tool result value as a readable text block for the model. */
   const asText = (_args: unknown, value: unknown) => [
@@ -64,21 +119,24 @@ export function apply(ctx: Context): void {
 
   ctx.tools.register(defTool(
     'list_sessions',
-    '列出当前进程内存中所有"活"的对话（含当前对话），返回每条的会话 id 与状态（idle/running）。'
-      + '要发消息给另一个对话时，先调用本工具拿它的会话 id，再用 send_to_session 投递。'
+    '列出当前进程内存中所有"活"的对话（含当前对话），返回每条的会话 id、名称（会话标题）、状态与工作目录。'
+      + '要发消息给另一个对话时，先调用本工具查看准确的会话 id 或名称，再用 send_to_session 投递。'
       + '注意：只有已加载/正在运行的对话会出现在这里；冷(未打开)的对话不在列表中。'
-      + '本工具列的是"平级对话"，不是 subagent 子代理。',
+      + '本工具列的是"平级对话"，不是 subagent 子代理。'
+      + '如果用户提到的名字与多个会话相近、无法确定对应关系，请向用户确认，不要猜测。',
     {},
     async () => {
-      const list = agents.list()
+      const sessions = await liveSessionsWithNames()
       return {
         ok: true,
-        count: list.length,
-        sessions: list.map(a => ({
-          id: a.id,
-          status: a.status,
-          ...(a.session?.header?.cwd === undefined ? {} : { cwd: a.session.header.cwd }),
+        count: sessions.length,
+        sessions: sessions.map(s => ({
+          id: s.id,
+          name: s.name,
+          status: s.status,
+          ...(s.cwd === undefined ? {} : { cwd: s.cwd }),
         })),
+        hint: '发送消息时请使用准确的会话 id 或完整名称。如果用户提到的名字与多个会话相近、无法确定对应关系，请先向用户确认，不要猜测。',
       }
     },
   ))
@@ -86,38 +144,66 @@ export function apply(ctx: Context): void {
   ctx.tools.register(defTool(
     'send_to_session',
     '把一条文本消息直接投递并唤醒另一个"对话"（跨对话调用，非 subagent）。目标对话收到后会在自己的独立上下文中立即开始新一轮处理。'
-      + '目标用会话 id 指定（先用 list_sessions 查）。消息会被当作一条普通 user 消息投送给对方。'
-      + '默认 expectReply=true：会自动在消息末尾附上"完成后把结果回传给我"的指令，因此对方完成后会主动回传，无需你手写回传要求。'
+      + '目标用会话 id 或完整名称指定（先用 list_sessions 查）。只接受精确匹配：id 必须完全一致，名称必须完全一致（不区分大小写），不支持模糊/片段匹配。'
+      + '如果用户提到的名字与多个会话相近或无法确定，请先向用户确认，不要猜测。'
+      + '默认 expectReply=true：会自动在消息末尾附上"完成后把结果回传给我"的指令（含发送方信息），因此对方完成后会主动回传，无需你手写回传要求。'
       + '当你这条消息本身就是"回传结果"时，请设 expectReply=false，避免对方再回传（防止来回循环）。',
     {
-      sessionId: { type: 'string', required: true, description: '目标对话的会话 id（来自 list_sessions）。' },
+      sessionId: { type: 'string', required: true, description: '目标对话的会话 id 或完整名称（来自 list_sessions，需精确一致）。' },
       message: { type: 'string', required: true, description: '要发送给对方对话的正文。' },
       expectReply: { type: 'boolean', description: '是否要求对方完成后回传（默认 true）。回传结果时请设为 false。' },
     },
     async (args: { sessionId?: unknown; message?: unknown; expectReply?: unknown }, exec: any) => {
-      const targetId = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
+      const targetRef = typeof args.sessionId === 'string' ? args.sessionId.trim() : ''
       const text = typeof args.message === 'string' ? args.message.trim() : ''
-      if (targetId === '') return { ok: false, error: 'sessionId 不能为空' }
+      if (targetRef === '') return { ok: false, error: 'sessionId 不能为空' }
       if (text === '') return { ok: false, error: 'message 不能为空' }
+
+      const sessions = await liveSessionsWithNames()
+      // 严格匹配：先精确 id，再精确完整名称（不区分大小写）。不做模糊/片段匹配。
+      let matched = sessions.filter(s => s.id === targetRef)
+      if (matched.length === 0) {
+        const lower = targetRef.toLowerCase()
+        matched = sessions.filter(s => s.name.toLowerCase() === lower)
+      }
+      if (matched.length === 0) {
+        return {
+          ok: false,
+          error: '未找到与 "' + targetRef + '" 完全匹配的对话。send_to_session 只接受准确的会话 id 或完整名称。'
+            + '请先调用 list_sessions 查看准确值；如果用户提到的名字与多个会话相近，请向用户确认后再发。',
+        }
+      }
+      if (matched.length > 1) {
+        return {
+          ok: false,
+          error: '有多个对话与 "' + targetRef + '" 匹配：'
+            + matched.map(s => s.name + '(' + s.id + ')').join('、')
+            + '。请向用户确认具体是哪一个，再用准确的 id 或名称重新发送。',
+        }
+      }
+      const session = matched[0]
+      const targetId = session.id
 
       const expectReply = args.expectReply !== false
       const senderId = exec?.agent?.id
       // 防发给自己：目标 id 不能等于当前对话。
       if (senderId !== undefined && senderId !== '' && targetId === String(senderId)) {
-        return { ok: false, error: '不能给自己发消息（sessionId 等于当前对话，请用 list_sessions 重新确认目标 id）' }
+        return { ok: false, error: '不能给自己发消息（目标是当前对话「' + session.name + '」）。请用 list_sessions 重新确认目标。' }
       }
 
       const target = agents.get(targetId)
       if (target === undefined) {
-        return { ok: false, error: '未找到该对话（可能离线/未加载，或 id 不对）：' + targetId }
+        return { ok: false, error: '该对话当前不在线（未加载），无法投递：' + session.name + '（' + targetId + '）' }
       }
 
       let deliver = text
       if (expectReply && senderId !== undefined && senderId !== '') {
+        const senderName = sessions.find(s => s.id === String(senderId))?.name
+          ?? '会话' + shortId(String(senderId))
         // 附上任务前 40 字作为关联标识，让对方回传时复述，发送方据此区分多条回传。
         const taskBrief = text.replace(/\s+/g, ' ').slice(0, 40)
-        deliver = text + '\n\n[自动附加·来自发送方] 请基于你的职责独立完成上面的任务。完成后，务必用 send_to_session 把结果回传给我：\n'
-          + '- sessionId 填：' + String(senderId) + '\n'
+        deliver = text + '\n\n[自动附加·来自发送方「' + senderName + '」] 请基于你的职责独立完成上面的任务。完成后，务必用 send_to_session 把结果回传给我：\n'
+          + '- sessionId 填：' + String(senderId) + '（或我的名称「' + senderName + '」）\n'
           + '- message 填：先写一行「完成的任务：' + taskBrief + '」，再写完成结果摘要（只写结果，不用复述过程）。\n'
           + '- expectReply 填：false（因为这条就是回传，无需我再回传）。'
       }
@@ -132,7 +218,7 @@ export function apply(ctx: Context): void {
       // 派活即收尾：投递成功后结束当前这一轮（整组工具调用执行完后才生效），
       // 避免发送方在当轮空等一个它永远拿不到的回复——回传会在下一轮作为新消息唤醒它。
       if (exec !== undefined && typeof exec.concludeTurn === 'function') exec.concludeTurn()
-      return { ok: true, deliveredTo: targetId, expectReply, senderId: senderId ?? null }
+      return { ok: true, deliveredTo: targetId, targetName: session.name, expectReply, senderId: senderId ?? null }
     },
   ))
 }
