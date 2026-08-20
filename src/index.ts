@@ -144,10 +144,10 @@ export function apply(ctx: Context): void {
   ctx.tools.register(defTool(
     'send_to_session',
     '把一条文本消息直接投递并唤醒另一个"对话"（跨对话调用，非 subagent）。目标对话收到后会在自己的独立上下文中立即开始新一轮处理。'
+      + '你只需要提供任务内容（message）即可：消息来源说明（来自哪个对话、不是人类用户、应以什么口吻回应）和"完成后如何回传结果"的命令，都由本工具自动拼接进消息，无需你在 message 里写。'
       + '目标用会话 id 或完整名称指定（先用 list_sessions 查）。只接受精确匹配：id 必须完全一致，名称必须完全一致（不区分大小写），不支持模糊/片段匹配。'
       + '如果用户提到的名字与多个会话相近或无法确定，请先向用户确认，不要猜测。'
-      + '默认 expectReply=true：会自动在消息末尾附上"完成后把结果回传给我"的指令（含发送方信息），因此对方完成后会主动回传，无需你手写回传要求。'
-      + '当你这条消息本身就是"回传结果"时，请设 expectReply=false，避免对方再回传（防止来回循环）。',
+      + 'expectReply 默认 true（自动附带"完成后回传"命令）。只有当这条消息本身就是"回传结果"时，才显式传 expectReply=false；其他情况保持默认，不要传 false。',
     {
       sessionId: { type: 'string', required: true, description: '目标对话的会话 id 或完整名称（来自 list_sessions，需精确一致）。' },
       message: { type: 'string', required: true, description: '要发送给对方对话的正文。' },
@@ -196,14 +196,19 @@ export function apply(ctx: Context): void {
         return { ok: false, error: '该对话当前不在线（未加载），无法投递：' + session.name + '（' + targetId + '）' }
       }
 
-      let deliver = text
+      // 拼接消息：前置场景描述（无条件，明确来源与身份）+ 任务内容 + 完成回传命令。
+      const senderName = senderId === undefined || senderId === ''
+        ? '未知对话'
+        : sessions.find(s => s.id === String(senderId))?.name ?? '会话' + shortId(String(senderId))
+      let deliver = '【跨对话消息·来自「' + senderName + '」】这条消息是另一个对话（' + senderName + '）通过工具发送给你的，'
+        + '不是人类用户发来的。请以你自己的身份独立处理；你做出的任何回应、说明或结果，都是回应「' + senderName + '」这个对话，'
+        + '不要以"回复用户"的口吻。'
+        + '\n\n── 任务内容 ──\n' + text
       if (expectReply && senderId !== undefined && senderId !== '') {
-        const senderName = sessions.find(s => s.id === String(senderId))?.name
-          ?? '会话' + shortId(String(senderId))
         // 附上任务前 40 字作为关联标识，让对方回传时复述，发送方据此区分多条回传。
         const taskBrief = text.replace(/\s+/g, ' ').slice(0, 40)
-        deliver = text + '\n\n[自动附加·来自发送方「' + senderName + '」] 请基于你的职责独立完成上面的任务。完成后，务必用 send_to_session 把结果回传给我：\n'
-          + '- sessionId 填：' + String(senderId) + '（或我的名称「' + senderName + '」）\n'
+        deliver += '\n\n── 完成后 ──\n完成上述任务后，务必用 send_to_session 把结果回传给我：\n'
+          + '- sessionId 填：' + String(senderId) + '（或名称「' + senderName + '」）\n'
           + '- message 填：先写一行「完成的任务：' + taskBrief + '」，再写完成结果摘要（只写结果，不用复述过程）。\n'
           + '- expectReply 填：false（因为这条就是回传，无需我再回传）。'
       }

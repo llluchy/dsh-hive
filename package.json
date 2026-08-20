@@ -1,7 +1,7 @@
 {
   "name": "dsh-hive",
   "description": "Turn DeepSeek Harness conversations into a hive: send_to_session delivers a task straight into another conversation and wakes it (with automatic result callback); list_sessions enumerates live conversations to target",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
